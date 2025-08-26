@@ -2,15 +2,16 @@
 
 import { useEffect, useState, useMemo, useCallback } from "react";
 import { useParams } from "next/navigation";
-import type { CardDto, HandSnapshot } from "@/lib/types";
+import type { CardDto, EnhancedBotMove, HandSnapshot } from "@/lib/types";
 import GameTable from "@/components/GameTable";
-import { canSnapTo, cardKey, isRankCapture, normalizeCards, sumValues } from "@/lib/ui/cards";
+import { cardKey, isRankCapture, normalizeCards } from "@/lib/ui/cards";
 import { bidApi, BidStartSnapshot } from "@/lib/api/bid.api";
 import { BidModal } from "@/components/BidModal";
 import type { DealStep } from "@/components/DealAnimator";
 import { handsApi } from "@/lib/api/hands.api";
 import { actionsApi } from "@/lib/api/actions.api";
 import { http } from "@/lib/http/axios";
+import { LiveScorePanel } from "@/components/LiveScorePanel";
 
 type SeatVis = "hidden" | "back" | "face";
 type DragState = {
@@ -19,42 +20,53 @@ type DragState = {
   hoverTable: CardDto[];
   snapped?: CardDto | null;
 };
+
 export default function GamePage() {
   const params = useParams<{ id: string }>();
   const gameId = params.id;
+
   const [error, setError] = useState<string | null>(null);
   const [phase, setPhase] = useState<"bid" | "hand-partial" | "hand">("bid");
+
   const [bid, setBid] = useState<BidStartSnapshot | null>(null);
   const [animBidDeal, setAnimBidDeal] = useState(false);
   const [showBidModal, setShowBidModal] = useState(false);
   const [bidValue, setBidValue] = useState<number | null>(null);
+
   const [handSnap, setHandSnap] = useState<HandSnapshot | null>(null);
+
   const [restSteps, setRestSteps] = useState<DealStep[] | null>(null);
   const [restActive, setRestActive] = useState(false);
+
   const [selectedHand, setSelectedHand] = useState<CardDto | null>(null);
   const [selectedTable, setSelectedTable] = useState<CardDto[]>([]);
   const selectedTableKeys = useMemo(() => selectedTable.map(cardKey), [selectedTable]);
+
   const [revealTable, setRevealTable] = useState<CardDto[] | null>(null);
   const [bidderSeat0Preview, setBidderSeat0Preview] = useState<CardDto[] | null>(null);
-  const [drag, setDrag] = useState<DragState>({ active: false, card: null, hoverTable: [] });
-  const [botVisual, setBotVisual] = useState<null | {
-    type: "Throw" | "Capture" | "House";
-    seat: 0 | 1 | 2 | 3;
-    handCard?: CardDto | null;
-    tablePick?: CardDto[] | null;
-    toast?: string;
-  }>(null);
-  const setBotVisualSafe = (v: typeof botVisual) => setBotVisual(v);
-  // Visibility policy:
-  // - bid: Seat 0 face (to let bidder see the 4 preview cards), opponents back
-  // - hand-partial: everyone back (change 0:"face" if you want Seat0 visible here)
-  // - hand: Seat 0 face, opponents back
+  const [thinkingBot, setThinkingBot] = useState<{ seat: number; name: string } | null>(null);
+  const [phaseTransition, setPhaseTransition] = useState<string | null>(null);
+  const [drag, setDrag] = useState<DragState>({
+    active: false,
+    card: null,
+    hoverTable: [],
+    snapped: null
+  });
+
+  const [botVisual, setBotVisual] = useState<EnhancedBotMove | null>(null);
+  useEffect(() => {
+    return () => {
+      setBotVisual(null);
+      setDrag({ active: false, card: null, hoverTable: [], snapped: null });
+    };
+  }, []);
   const seatVisibility: Record<0 | 1 | 2 | 3, SeatVis> =
     phase === "bid"
       ? { 0: "face", 1: "back", 2: "back", 3: "back" }
       : phase === "hand-partial"
         ? { 0: "face", 1: "back", 2: "back", 3: "back" }
         : { 0: "face", 1: "back", 2: "back", 3: "back" };
+
   const placeholderSnap: HandSnapshot = useMemo(
     () => ({
       gameId,
@@ -69,50 +81,321 @@ export default function GamePage() {
     [gameId]
   );
 
+  // Animate deal of remaining cards from 4 to target (11)
+  function buildDealRestStepsToTarget(snap: HandSnapshot, target: number): DealStep[] {
+    const steps: DealStep[] = [];
+    for (let r = 4; r < target; r++) {
+      for (let seat = 0 as 0 | 1 | 2 | 3; seat <= 3; seat = ((seat + 1) as 0 | 1 | 2 | 3)) {
+        const card = snap.hands?.[seat]?.[r];
+        if (!card) continue;
+        steps.push({ seat, index: r, card });
+      }
+    }
+    return steps;
+  }
+
+  function diffBotMove(prev: HandSnapshot, next: HandSnapshot) {
+    const actor = prev.turnSeat as 0 | 1 | 2 | 3;
+    const prevHand = (prev.hands?.[actor] ?? []);
+    const nextHand = (next.hands?.[actor] ?? []);
+    const prevFloor = prev.floorLoose ?? [];
+    const nextFloor = next.floorLoose ?? [];
+    const prevH = prev.houses ?? [];
+    const nextH = next.houses ?? [];
+
+    const sameCard = (a: CardDto, b: CardDto) =>
+      a.value === b.value &&
+      a.rank?.toLowerCase() === b.rank?.toLowerCase() &&
+      a.suit?.toLowerCase() === b.suit?.toLowerCase();
+
+    // House
+    if (nextH.length > prevH.length) {
+      const handCard = prevHand.find(ph => !nextHand.some(nh => sameCard(nh, ph))) ?? null;
+      const removedFromFloor = prevFloor.filter(pf => !nextFloor.some(nf => sameCard(nf, pf)));
+      const newHouse = nextH.find(hn => !prevH.some(hp => hp.value === hn.value && (hp.cards?.length ?? 0) === (hn.cards?.length ?? 0)));
+      return {
+        type: "House" as const,
+        seat: actor,
+        handCard,
+        tablePick: removedFromFloor,
+        toast: `Seat ${actor} made a House${newHouse?.value ? ` of ${newHouse.value}` : ""}.`
+      };
+    }
+
+    // Throw
+    if (nextFloor.length === prevFloor.length + 1) {
+      const added = nextFloor.find(nf => !prevFloor.some(pf => sameCard(pf, nf)));
+      return {
+        type: "Throw" as const,
+        seat: actor,
+        handCard: added ?? null,
+        tablePick: null,
+        toast: `Seat ${actor} threw ${added?.rank ?? ""}.`
+      };
+    }
+
+    // Capture
+    if (nextFloor.length < prevFloor.length) {
+      const removed = prevFloor.filter(pf => !nextFloor.some(nf => sameCard(nf, pf)));
+      const handCard = prevHand.find(ph => !nextHand.some(nh => sameCard(nh, ph))) ?? null;
+      return {
+        type: "Capture" as const,
+        seat: actor,
+        handCard,
+        tablePick: removed,
+        toast: `Seat ${actor} captured ${removed.map(r => r.rank).join(", ")}.`
+      };
+    }
+
+    return null;
+  }
+
+
+  // Enhanced bot move toast messages
+  function createEnhancedBotMoveToast(move: any, personality: any) {
+    const botName = personality?.name || `Bot ${move.seat}`;
+    const personalityHint = personality?.aggressiveness > 0.7 ? " (aggressive play)" :
+      personality?.aggressiveness < 0.3 ? " (cautious play)" : "";
+
+    switch (move.type) {
+      case "House":
+        return `${botName} built a strategic house${personalityHint}`;
+      case "Capture":
+        const cardCount = move.tablePick?.length || 0;
+        const captureMsg = cardCount > 1 ? `captured ${cardCount} cards` : "captured a card";
+        return `${botName} ${captureMsg}${personalityHint}`;
+      case "Throw":
+        return `${botName} threw ${move.handCard?.rank || 'a card'}${personalityHint}`;
+      default:
+        return `${botName} made a move${personalityHint}`;
+    }
+  }
+
+  // Enhanced animation timing with personality factors
+  function calculateEnhancedAnimationTime(move: any, personality: any) {
+    let baseTime = 2500; // Increased from 1500 to 2500
+
+    // Move complexity affects timing
+    switch (move.type) {
+      case "House":
+        baseTime = 3500; // Increased from 2200 to 3500
+        break;
+      case "Capture":
+        const cardCount = move.tablePick?.length || 1;
+        baseTime = 2000 + (cardCount * 600); // Increased base and per-card time
+        break;
+      case "Throw":
+        baseTime = 1800; // Increased from 1000 to 1800
+        break;
+    }
+
+    // Personality-based timing adjustments
+    if (personality?.aggressiveness > 0.7) {
+      baseTime *= 0.9; // Even aggressive bots are slower now
+    } else if (personality?.aggressiveness < 0.3) {
+      baseTime *= 1.6; // Cautious bots take even more time
+    }
+    if (move.type === "House" && personality?.houseFocus > 0.7) {
+      baseTime *= 1.3;
+    }
+    return Math.max(1500, Math.min(5000, baseTime)); // 1.5-5 seconds range
+  }
+
+
+  async function runBotsUntilHumanTurn(gameId: string, startSnap: HandSnapshot) {
+    let snap = startSnap;
+    let loops = 0;
+    const MAX_BOT_LOOPS = 6;
+
+    while (loops++ < MAX_BOT_LOOPS) {
+      const isBotArr = snap.isBot ?? [false, false, false, false];
+
+      if (!isBotArr[snap.turnSeat]) {
+        console.log(`Turn reached human player at seat ${snap.turnSeat}`);
+        break;
+      }
+
+      try {
+        const botPersonality = await getBotPersonality(gameId, snap.turnSeat);
+        const botName = botPersonality?.name || `Bot ${snap.turnSeat}`;
+
+        setThinkingBot({ seat: snap.turnSeat, name: botName });
+        const thinkingTime = botPersonality?.aggressiveness > 0.7 ? 1200 :
+          botPersonality?.aggressiveness < 0.3 ? 2000 :  
+            1600;
+        await new Promise(resolve => setTimeout(resolve, thinkingTime));
+
+        console.log(`${botName} taking turn...`);
+
+        const beforeBotMove = performance.now();
+        const afterResp = await http.post(`/api/games/${gameId}/bots/act`, {});
+        const botActionTime = performance.now() - beforeBotMove;
+
+        const after = afterResp.data as HandSnapshot;
+        const mv = diffBotMove(snap, after);
+        if (mv) {
+          const enhancedMove = {
+            ...mv,
+            botName,
+            personality: botPersonality,
+            actionTime: Math.round(botActionTime),
+            toast: createEnhancedBotMoveToast(mv, botPersonality)
+          };
+
+          setBotVisual(enhancedMove);
+          const animationTime = calculateEnhancedAnimationTime(mv, botPersonality);
+          await new Promise(resolve => setTimeout(resolve, animationTime));
+
+          setBotVisual(null);
+        }
+
+        setThinkingBot(null);
+        setHandSnap(after);
+        snap = after;
+        if (after.handPhase === 2) {
+          console.log("Hand phase is Full, stopping bot loop");
+          break;
+        }
+debugger
+        if (after.handPhase === 1 && isChaalPhaseComplete(after)) {
+          console.log("Chaal phase complete, triggering completion");
+
+          // Show phase transition message
+          setPhaseTransition("Dealing remaining cards...");
+
+          try {
+            const completedResp = await http.post(`/api/games/${gameId}/hands/complete-after-chaal`, {});
+            const completedSnap = completedResp.data as HandSnapshot;
+            setHandSnap(completedSnap);
+
+            if (completedSnap.handPhase === 2) {
+              const steps = buildDealRestStepsToTarget(completedSnap, 11);
+              setRestSteps(steps);
+              setRestActive(true);
+              setPhase("hand");
+            }
+          } catch (error) {
+            console.error("Failed to complete chaal phase:", error);
+          }
+
+          setPhaseTransition(null);
+          break;
+        }
+
+      } catch (error) {
+        console.error(`Bot ${snap.turnSeat} action failed:`, error);
+        setThinkingBot(null); // Clear thinking indicator on error
+        setError(`Bot ${snap.turnSeat} encountered an error. Please refresh the page.`);
+        break;
+      }
+    }
+
+    if (loops >= MAX_BOT_LOOPS) {
+      console.warn("Bot loop reached maximum iterations, stopping");
+      setThinkingBot(null);
+      setError("Bot actions took too long. Please refresh the page.");
+    }
+  }
+
+
+  // Helper function to get bot personality
+  async function getBotPersonality(gameId: string, seat: number) {
+    try {
+      const response = await http.get(`/api/games/${gameId}/bots/personality/${seat}`);
+      return response.data;
+    } catch (error) {
+      console.log(`Could not get personality for bot ${seat}:`, error);
+      return null;
+    }
+  }
+
+  // Create contextual toast messages
+  function createBotMoveToast(move: any, personality: any) {
+    const botName = personality?.name || `Bot ${move.seat}`;
+
+    switch (move.type) {
+      case "House":
+        return `${botName} built a house${move.houseValue ? ` of ${move.houseValue}` : ''}`;
+      case "Capture":
+        const cardCount = move.tablePick?.length || 0;
+        return `${botName} captured ${cardCount} card${cardCount !== 1 ? 's' : ''}`;
+      case "Throw":
+        return `${botName} threw ${move.handCard?.rank || 'a card'}`;
+      default:
+        return `${botName} made a move`;
+    }
+  }
+
+  // Calculate appropriate animation timing
+  function calculateAnimationTime(move: any, personality: any) {
+    let baseTime = 1000; // Base 1 second
+
+    // Adjust based on move complexity
+    switch (move.type) {
+      case "House":
+        baseTime = 1500; // Houses take longer to visualize
+        break;
+      case "Capture":
+        const cardCount = move.tablePick?.length || 1;
+        baseTime = 800 + (cardCount * 200); // More cards = longer animation
+        break;
+      case "Throw":
+        baseTime = 600; // Throws are quick
+        break;
+    }
+
+    // Personality adjustments
+    if (personality?.aggressiveness > 0.7) {
+      baseTime *= 0.8; // Aggressive bots move faster
+    } else if (personality?.aggressiveness < 0.3) {
+      baseTime *= 1.2; // Cautious bots take more time
+    }
+
+    return Math.max(500, Math.min(2000, baseTime)); // Clamp between 0.5-2 seconds
+  }
+
+  function isChaalPhaseComplete(snapshot: HandSnapshot) {
+    return (snapshot.chaalCount ?? []).length === 4 &&
+      (snapshot.chaalCount ?? []).every((c: number) => c === 1);
+  }
+
+  // DRAG + PLAY HANDLERS
+
   const onDropOnTableCard = async (tableCard: CardDto) => {
     if (!drag.active || !drag.card) return;
+
     try {
+      setError(null);
       const handCard = drag.card;
-
       const isHouse = bidValue != null && (handCard.value + tableCard.value === bidValue);
-      const isRankCap = (handCard.rank?.toLowerCase() === tableCard.rank?.toLowerCase()) || (handCard.value === tableCard.value);
+      const isRankCap = (handCard.rank?.toLowerCase() === tableCard.rank?.toLowerCase()) ||
+        (handCard.value === tableCard.value);
 
+      let res;
       if (isHouse) {
-        const res = await actionsApi.play(gameId, {
+        res = await actionsApi.play(gameId, {
           type: "House",
           seat: 0,
           card: handCard,
           tablePick: [tableCard],
         });
-        setHandSnap(res.snapshot);
       } else if (isRankCap) {
-        const res = await actionsApi.play(gameId, {
+        res = await actionsApi.play(gameId, {
           type: "Capture",
           seat: 0,
           card: handCard,
           tablePick: [tableCard],
         });
-        setHandSnap(res.snapshot);
       } else {
-        // Not a valid target: fall back to Throw to the table center
-        const res = await actionsApi.play(gameId, {
+        res = await actionsApi.play(gameId, {
           type: "Throw",
           seat: 0,
           card: handCard,
         });
-        setHandSnap(res.snapshot);
       }
 
-      // if (phase === "hand-partial") {
-      //   const full = await http.post(`/api/games/${gameId}/hands/complete-after-partial`, {});
-      //   const data = full.data as HandSnapshot;
-      //   data.hands = (data.hands ?? []).map(h => normalizeCards(h));
-      //   data.floorLoose = normalizeCards(data.floorLoose);
-      //   setHandSnap(data);
-      //   const steps = buildDealRestSteps(data);
-      //   setRestSteps(steps);
-      //   setRestActive(true);
-      // }
+      setHandSnap(res.snapshot);
+      await runBotsUntilHumanTurn(gameId, res.snapshot);
     } catch (e: any) {
       setError(e?.response?.data?.message ?? e?.message ?? "Action failed");
     } finally {
@@ -122,11 +405,12 @@ export default function GamePage() {
     }
   };
 
+
   const onDragStartHand = useCallback((card: CardDto) => {
     if (phase === "bid") return;
     if (seatVisibility[0] !== "face") return;
     setDrag({ active: true, card, hoverTable: [], snapped: null });
-  }, [phase]);
+  }, [phase, seatVisibility]);
 
   const onHoverToggleTable = (tableCard: CardDto) => {
     setDrag((prev) => {
@@ -145,58 +429,54 @@ export default function GamePage() {
     });
   };
 
-
-  // File: src/app/game/[id]/page.tsx
   const onDropToTable = async () => {
     if (!drag.active || !drag.card) return;
     try {
+      setError(null);
       const handCard = drag.card;
-      const pick = drag.hoverTable; // at most 1 due to snapped logic
+      const pick = drag.hoverTable; // CardDto[]
       const hasPick = pick.length === 1;
-      const tableCard = hasPick ? pick[0] : null;
+      const tableCard: CardDto | null = hasPick ? pick[0] : null; // FIX: pick, not pick
 
-      // 1) House (hand + pick = bid)
-      const okHouse =
+      let res;
+      if (
         bidValue != null &&
         hasPick &&
-        tableCard != null &&
-        handCard.value + tableCard.value === bidValue;
-
-      if (okHouse) {
-        const res = await actionsApi.play(gameId, {
+        tableCard &&
+        handCard.value + tableCard.value === bidValue
+      ) {
+        res = await actionsApi.play(gameId, {
           type: "House",
           seat: 0,
           card: handCard,
-          tablePick: [tableCard], // tableCard is non-null here
+          tablePick: [tableCard], // FIX: CardDto[], not CardDto[][]
         });
-        setHandSnap(res.snapshot);
-      } else if (hasPick && tableCard && isRankCapture(handCard, tableCard)) {
-        const res = await actionsApi.play(gameId, {
+      } else if (
+        hasPick &&
+        tableCard &&
+        (
+          (handCard.rank?.toLowerCase() === tableCard.rank?.toLowerCase()) ||
+          (handCard.value === tableCard.value)
+        )
+      ) {
+        res = await actionsApi.play(gameId, {
           type: "Capture",
           seat: 0,
           card: handCard,
-          tablePick: [tableCard],
+          tablePick: [tableCard], // FIX
         });
-        setHandSnap(res.snapshot);
       } else {
-        const res = await actionsApi.play(gameId, {
+        res = await actionsApi.play(gameId, {
           type: "Throw",
           seat: 0,
           card: handCard,
         });
-        setHandSnap(res.snapshot);
       }
 
-      // if (phase === "hand-partial") {
-      //   const full = await http.post(`/api/games/${gameId}/hands/complete-after-partial`, {});
-      //   const data = full.data as HandSnapshot;
-      //   data.hands = (data.hands ?? []).map(h => normalizeCards(h));
-      //   data.floorLoose = normalizeCards(data.floorLoose);
-      //   setHandSnap(data);
-      //   const steps = buildDealRestSteps(data);
-      //   setRestSteps(steps);
-      //   setRestActive(true);
-      // }
+      setHandSnap(res.snapshot);
+
+      // Kick bot loop
+      await runBotsUntilHumanTurn(gameId, res.snapshot);
     } catch (e: any) {
       setError(e?.response?.data?.message ?? e?.message ?? "Action failed");
     } finally {
@@ -206,6 +486,8 @@ export default function GamePage() {
     }
   };
 
+
+  // BID
 
   const bidPhaseSnap: HandSnapshot | null = useMemo(() => {
     if (!bid) return null;
@@ -226,23 +508,20 @@ export default function GamePage() {
     };
   }, [bid, bidderSeat0Preview, gameId]);
 
-  // Start bid flow on mount
   useEffect(() => {
     async function start() {
       try {
         setError(null);
         setPhase("bid");
-        const b = await bidApi.start(gameId);
+        const b = await bidApi.start(gameId, 1);
         setBid(b);
 
-        // Normalize Seat0 preview
         const seat0 = normalizeCards(b.bidderCards);
         setBidderSeat0Preview(seat0);
 
         setAnimBidDeal(true);
         setShowBidModal(b.bidderSeat === 0);
 
-        // reset
         setRevealTable(null);
         setBidValue(null);
         setSelectedHand(null);
@@ -255,16 +534,14 @@ export default function GamePage() {
     start();
   }, [gameId]);
 
-  // Interaction: Seat 0 cards only if face-up and not during bid (optional guard)
   function onSelectCard(seat: number, card: CardDto) {
-    if (phase === "bid") return; // prevent selecting during bid; remove if you allow it
+    if (phase === "bid") return;
     if (seat !== 0) return;
     if (seatVisibility[0] !== "face") return;
     setSelectedHand(card);
     setSelectedTable([]);
   }
 
-  // Toggle table card (for capture/house subset selection)
   function onToggleTableCard(card: CardDto) {
     if (!card) return;
     setSelectedTable((prev) => {
@@ -293,13 +570,12 @@ export default function GamePage() {
     }
     return steps;
   }
-  // Bid placement
+
   async function handleBid(value: number | "none") {
     try {
       setError(null);
 
       if (value === "none") {
-        // Redeal until Seat 0 has a qualifying ≥9
         let tries = 0;
         setShowBidModal(false);
         while (true) {
@@ -317,136 +593,38 @@ export default function GamePage() {
         return;
       }
 
-      // Server: must hold exact V (in forehand 4) and floor can make V
+      // 1. Place the bid
       const placed = await bidApi.place(gameId, value);
       setBidValue(value);
       setShowBidModal(false);
 
-      // Reveal floor and load partial snapshot (server stored it during place)
+      // 2. START THE HAND (this creates the HandSnapshot)
+      const handStartResp = await http.post(`/api/games/${gameId}/hands/start-after-bid`, {});
+      const handSnapshot = handStartResp.data as HandSnapshot;
+
+      // 3. Now we can use the created hand
       setRevealTable(normalizeCards(placed.tableCards));
-      const partial = await handsApi.latest(gameId);
-      partial.hands = (partial.hands ?? []).map(h => normalizeCards(h));
-      partial.floorLoose = normalizeCards(partial.floorLoose);
-      setHandSnap(partial);
-      setBidderSeat0Preview(null); // clear preview after partial snapshot is loaded
+      handSnapshot.hands = (handSnapshot.hands ?? []).map(h => normalizeCards(h));
+      handSnapshot.floorLoose = normalizeCards(handSnapshot.floorLoose);
+      setHandSnap(handSnapshot);
+      setBidderSeat0Preview(null);
       setPhase("hand-partial");
+
+      // 4. Start bot loop with the new hand
+      await runBotsUntilHumanTurn(gameId, handSnapshot);
+
     } catch (e: any) {
       setError(e?.response?.data?.message ?? e?.message ?? "Failed to place bid");
       setShowBidModal(true);
     }
   }
 
-  function buildDealRestStepsToTarget(snap: HandSnapshot, target: number): DealStep[] {
-    const steps: DealStep[] = [];
-    for (let r = 4; r < target; r++) {
-      for (let seat = 0 as 0 | 1 | 2 | 3; seat <= 3; seat = ((seat + 1) as 0 | 1 | 2 | 3)) {
-        const card = snap.hands?.[seat]?.[r];
-        if (!card) continue;
-        steps.push({ seat, index: r, card });
-      }
-    }
-    return steps;
-  }
 
-  // Sums and button enabling
+  // Enable footer buttons when appropriate
   const sumSelectedTable = useMemo(
     () => selectedTable.reduce((acc, c) => acc + (c?.value ?? 0), 0),
     [selectedTable]
   );
-
-  function diffBotMove(prev: HandSnapshot, next: HandSnapshot) {
-    const actor = prev.turnSeat as 0 | 1 | 2 | 3;
-    const prevHand = (prev.hands?.[actor] ?? []);
-    const nextHand = (next.hands?.[actor] ?? []);
-
-    const prevFloor = prev.floorLoose ?? [];
-    const nextFloor = next.floorLoose ?? [];
-
-    // New house created?
-    const prevH = prev.houses ?? [];
-    const nextH = next.houses ?? [];
-    if (nextH.length > prevH.length) {
-      // Find the new house
-      const newHouse = nextH.find(hn => !prevH.some(hp => hp.value === hn.value && (hp.cards?.length ?? 0) === (hn.cards?.length ?? 0)));
-      // Find played card (missing from hand)
-      const missing = prevHand.find(ph => !nextHand.some(nh => nh.suit === ph.suit && nh.rank === ph.rank && nh.value === ph.value));
-      // The table picks removed:
-      const removedFromFloor = prevFloor.filter(pf => !nextFloor.some(nf => nf.suit === pf.suit && nf.rank === pf.rank && nf.value === pf.value));
-      return {
-        type: "House" as const,
-        seat: actor,
-        handCard: missing ?? null,
-        tablePick: removedFromFloor,
-        toast: `Bot (Seat ${actor}) made a House of ${(newHouse?.value ?? "")}.`
-      };
-    }
-
-    // Throw detected: floor gained exactly one card (and hand -1)
-    if (nextFloor.length === prevFloor.length + 1) {
-      const added = nextFloor.find(nf => !prevFloor.some(pf => pf.suit === nf.suit && pf.rank === nf.rank && pf.value === nf.value));
-      return {
-        type: "Throw" as const,
-        seat: actor,
-        handCard: added ?? null,
-        tablePick: null,
-        toast: `Bot (Seat ${actor}) threw ${added?.rank ?? ""}.`
-      };
-    }
-
-    // Capture: floor lost >=1 and hand -1
-    if (nextFloor.length < prevFloor.length) {
-      const removed = prevFloor.filter(pf => !nextFloor.some(nf => nf.suit === pf.suit && nf.rank === pf.rank && nf.value === nf.value));
-      const missing = prevHand.find(ph => !nextHand.some(nh => nh.suit === ph.suit && nh.rank === ph.rank && nh.value === ph.value));
-      return {
-        type: "Capture" as const,
-        seat: actor,
-        handCard: missing ?? null,
-        tablePick: removed,
-        toast: `Bot (Seat ${actor}) captured ${removed.map(r => r.rank).join(", ")}.`
-      };
-    }
-
-    return null;
-  }
-
-  async function maybeBotActLoop(gameId: string) {
-    let loops = 0;
-    while (loops < 8) {
-      const prev = await handsApi.latest(gameId);
-      setHandSnap(prev);
-      const isBotArr = (prev as any).isBot ?? [false, false, false, false];
-      if (!isBotArr[prev.turnSeat]) break;
-
-      const res = await http.post(`/api/games/${gameId}/bots/act`, {});
-      const after = res.data as HandSnapshot;
-      setHandSnap(after);
-
-      // Visualize bot move
-      const mv = diffBotMove(prev, after);
-      if (mv) {
-        setBotVisual(mv); // use local state here in page, pass to GameTable via prop
-        await new Promise(r => setTimeout(r, 600));
-        setBotVisual(null);
-      }
-
-      // If partial chaal phase complete, top up to 11
-      const chaalDone = ((after as any).chaalCount ?? []).length === 4 && ((after as any).chaalCount ?? []).every((c: number) => c === 1);
-      if ((after as any).handPhase === "Partial" && chaalDone) {
-        const full = await http.post(`/api/games/${gameId}/hands/complete-after-chaal`, {});
-        const fullSnap = full.data as HandSnapshot;
-        setHandSnap(fullSnap);
-        const steps = buildDealRestStepsToTarget(fullSnap, 11);
-        setRestSteps(steps);
-        setRestActive(true);
-        setPhase("hand");
-        break;
-      }
-
-      loops++;
-    }
-  }
-
-
 
   const canHouse =
     (phase === "hand" || phase === "hand-partial") &&
@@ -467,11 +645,36 @@ export default function GamePage() {
     !!selectedHand &&
     selectedTable.length === 0;
 
-  // Actions
   async function doHouse() {
     if (!handSnap || !selectedHand || selectedTable.length === 0 || bidValue == null) return;
     try {
       setError(null);
+
+      // Check if a house with bidValue already exists
+      const hasHouse = (handSnap.houses ?? []).some(h => h.value === bidValue);
+
+      if (hasHouse) {
+        // For add-to-house, the hand card itself must equal the house value (not sum with table)
+        if (selectedHand.value !== bidValue) {
+          setError(`House ${bidValue} already exists. Need a ${bidValue} card in hand to add to it.`);
+          return;
+        }
+
+        const res = await actionsApi.play(gameId, {
+          type: "House",
+          seat: 0,
+          card: selectedHand,
+          tablePick: [] // not needed for add
+        });
+
+        setHandSnap(res.snapshot);
+        setSelectedHand(null);
+        setSelectedTable([]);
+        await runBotsUntilHumanTurn(gameId, res.snapshot);
+        return;
+      }
+
+      // Normal house creation path (no existing house of this value)
       const res = await actionsApi.play(gameId, {
         type: "House",
         seat: 0,
@@ -481,14 +684,7 @@ export default function GamePage() {
       setHandSnap(res.snapshot);
       setSelectedHand(null);
       setSelectedTable([]);
-
-      // if (phase === "hand-partial") {
-      //   const full = await http.post(`/api/games/${gameId}/hands/complete-after-partial`, {});
-      //   setHandSnap(full.data);
-      //   const steps = buildDealRestSteps(full.data);
-      //   setRestSteps(steps);
-      //   setRestActive(true);
-      // }
+      await runBotsUntilHumanTurn(gameId, res.snapshot);
     } catch (e: any) {
       setError(e?.response?.data?.message ?? e?.message ?? "House creation failed");
     }
@@ -507,17 +703,12 @@ export default function GamePage() {
       setSelectedHand(null);
       setSelectedTable([]);
 
-      // if (phase === "hand-partial") {
-      //   const full = await http.post<HandSnapshot>(`/api/games/${gameId}/hands/complete-after-partial`, {});
-      //   setHandSnap(full.data);
-      //   const steps = buildDealRestSteps(full.data);
-      //   setRestSteps(steps);
-      //   setRestActive(true);
-      // }
+      await runBotsUntilHumanTurn(gameId, res.snapshot);
     } catch (e: any) {
       setError(e?.response?.data?.message ?? e?.message ?? "Throw failed");
     }
   }
+
 
   async function doCapture() {
     if (!handSnap || !selectedHand || selectedTable.length === 0) return;
@@ -533,18 +724,12 @@ export default function GamePage() {
       setSelectedHand(null);
       setSelectedTable([]);
 
-      // if (phase === "hand-partial") {
-      //   const full = await http.post<HandSnapshot>(`/api/games/${gameId}/hands/complete-after-partial`, {});
-      //   setHandSnap(full.data);
-      //   const steps = buildDealRestSteps(full.data);
-      //   setRestSteps(steps);
-      //   setRestActive(true);
-      // }
+      await runBotsUntilHumanTurn(gameId, res.snapshot);
     } catch (e: any) {
       setError(e?.response?.data?.message ?? e?.message ?? "Capture failed");
     }
   }
-  debugger
+
   return (
     <main className="min-h-screen bg-[#063826] text-slate-50 p-6">
       <div className="max-w-6xl mx-auto space-y-4">
@@ -581,8 +766,6 @@ export default function GamePage() {
           }}
           onSelectCard={onSelectCard}
           selectedCardKey={selectedHandKey}
-          onToggleTableCard={onToggleTableCard}
-          selectedTableKeys={selectedTableKeys}
           revealTable={phase === "hand-partial" ? revealTable : null}
           seatVisibility={seatVisibility}
           onDragStartHand={onDragStartHand}
@@ -591,6 +774,7 @@ export default function GamePage() {
           dragState={drag}
           bidValue={bidValue ?? null}
           onDropOnTableCard={onDropOnTableCard}
+          botVisual={botVisual}
         />
 
         {/* Footer controls */}
@@ -635,6 +819,7 @@ export default function GamePage() {
         max={13}
         canSayNone={!!bid && bid.bidderSeat === 0 ? !((bid.bidderCards ?? []).some((c) => c.value >= 9)) : false}
       />
+      <LiveScorePanel gameId={gameId} />
     </main>
   );
 }

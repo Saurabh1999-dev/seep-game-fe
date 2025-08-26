@@ -5,6 +5,8 @@ import type { CreateGameResponse, HandSnapshot } from "@/lib/types";
 import Link from "next/link";
 import { gamesApi } from "@/lib/games.api";
 import { handsApi } from "@/lib/api/hands.api";
+import { BotConfigPanel } from "@/components/BotConfigPanel";
+import { LiveScorePanel } from "@/components/LiveScorePanel";
 
 export default function HomePage() {
   const [game, setGame] = useState<CreateGameResponse | null>(null);
@@ -66,6 +68,9 @@ export default function HomePage() {
             <pre className="text-sm whitespace-pre-wrap">{JSON.stringify(hand, null, 2)}</pre>
           </section>
         )}
+      </div>
+      <div className="fixed top-4 right-4 z-40">
+        <BotConfigPanel gameId={game?.gameId || ""} />
       </div>
     </main>
   );

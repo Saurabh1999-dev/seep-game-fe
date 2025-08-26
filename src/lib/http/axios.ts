@@ -8,29 +8,19 @@ export const http = axios.create({
   withCredentials: false,
 });
 
-// Optional: request/response logging (dev only)
 http.interceptors.request.use((config) => {
-  if (process.env.NODE_ENV !== "production") {
-    const method = (config.method ?? "get").toUpperCase();
-    const base = config.baseURL ?? "";
-    const url = config.url ?? "";
-    // eslint-disable-next-line no-console
-    console.log("[HTTP] →", method, `${base}${url}`, config.data ?? "");
-  }
   return config;
 });
 
+// Response interceptor with proper error handling
 http.interceptors.response.use(
-  (res) => {
-    if (process.env.NODE_ENV !== "production") {
-      // eslint-disable-next-line no-console
-      console.log("[HTTP] ←", res.status, res.config.url, res.data);
-    }
-    return res;
-  },
+  (res) => res,
   (err) => {
-    // eslint-disable-next-line no-console
-    console.error("[HTTP ERROR]", err?.response?.status, err?.response?.data ?? err.message);
+    // Only log errors in development
+    if (process.env.NODE_ENV === "development") {
+      console.error("[HTTP ERROR]", err?.response?.status, err?.response?.data ?? err.message);
+    }
     return Promise.reject(err);
   }
 );
+

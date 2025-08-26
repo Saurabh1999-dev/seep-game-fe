@@ -1,6 +1,5 @@
 import { http } from "@/lib/http/axios";
-
-export type CardDto = { suit: string; rank: string; value: number };
+import { CardDto } from "../types";
 
 export type BidStartSnapshot = {
   gameId: string;
@@ -27,11 +26,9 @@ export type PlaceBidResult = {
 
 export const bidApi = {
   start: async (gameId: string, dealerSeat?: number): Promise<BidStartSnapshot> => {
+    debugger
     const body = dealerSeat != null ? { dealerSeat } : {};
-    debugger
     const { data } = await http.post<BidStartSnapshot>(`/api/games/${gameId}/bid/start`, body);
-    
-    debugger
     return data;
   },
   place: async (gameId: string, value: number): Promise<PlaceBidResult> => {
